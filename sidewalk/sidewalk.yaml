@@ -1,0 +1,6 @@
+train: /root/hayong/YOLO_data/train/
+val: /root/hayong/YOLO_data/val/
+#test: D:\fire_smoke_dataset\datasets\fire\all_data\test\images
+
+nc: 1
+names: ['sidewalk']
