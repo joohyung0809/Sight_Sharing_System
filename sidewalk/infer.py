@@ -1,10 +1,6 @@
 from ultralytics import YOLO
 
-model = YOLO("./model/best.pt")
+model = YOLO("../model/roadway.pt")
 
 
-results = model(source="./5.mp4",
-                save=True,
-                show_boxes=False,
-                show_conf=True,
-                conf=0.8)
+results = model(source="../vid/5.mp4", save=True, show=True)
