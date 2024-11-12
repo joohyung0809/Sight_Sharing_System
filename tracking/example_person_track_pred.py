@@ -4,11 +4,9 @@ from ultralytics import YOLO
 from collections import defaultdict
 import sqlite3
 from datetime import datetime
-import math
 
-# Load the YOLOv8 models
-model = YOLO("../weights/yolov8n.pt")  # detection
-model2 = YOLO("../model/roadway.pt")  # segmentation
+# Load the YOLOv8 model
+model = YOLO("../weights/yolov8x.pt")  # detection
 
 # Open the webcam (use '0' for the default webcam)
 cap = cv2.VideoCapture(0)
@@ -26,109 +24,127 @@ fps = cap.get(cv2.CAP_PROP_FPS)
 # Store the track history
 track_history = defaultdict(lambda: [])
 
-# Connect to the database
+# Connect to the SQLite database
 conn = sqlite3.connect('triple_s.db')
 cursor = conn.cursor()
 
-
+# Function to calculate movement direction (left or right)
 def calculate_direction(start_point, end_point):
-    dx = end_point[0] - start_point[0]
-    dy = end_point[1] - start_point[1]
-    angle = math.atan2(dy, dx)
-
-    if -0.25 * math.pi <= angle < 0.25 * math.pi:
-        return "right"
-    elif 0.25 * math.pi <= angle < 0.75 * math.pi:
-        return "down"
-    elif -0.75 * math.pi <= angle < -0.25 * math.pi:
-        return "up"
+    if end_point[0] < start_point[0]:
+        return 'left'
     else:
-        return "left"
+        return 'right'
 
-
-def estimate_risk_level(direction):
-    # This is a simple risk estimation. You might want to implement a more sophisticated logic.
-    if direction in ["down", "right"]:
-        return "high"
-    else:
-        return "low"
-
-
-# Loop through the webcam frames
 while cap.isOpened():
     # Read a frame from the webcam
     success, frame = cap.read()
 
     if success:
         # Run YOLOv8 detection & tracking on the frame
-        results = model.track(frame, persist=True, classes=0)  # det&track
-        results2 = model2(frame, show_boxes=False, show_conf=True)  # segmentation
+        results = model.track(frame, persist=True, show_conf=False, classes=0)  # Detect only 'person'
 
-        # Create a copy of the original frame for drawing results
-        frame_with_edges = frame.copy()
+        # boxes와 track_ids를 초기화
+        boxes = []
+        track_ids = []
 
-        # Check if segmentation masks are available
-        if results2[0].masks is not None:
-            # Get the segmentation mask
-            seg_mask = results2[0].masks.data[0].cpu().numpy()  # Mask for the first segmented object
-            seg_mask = cv2.resize(seg_mask, (width, height))  # Resize to match frame size
+        if results and len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes.xywh.cpu()  # Bounding boxes (xywh format)
+            
+            # track_ids 추출할 때 None 체크
+            if results[0].boxes.id is not None:
+                track_ids = results[0].boxes.id.int().cpu().tolist()  # Track IDs
 
-            # Extract edges from the segmentation mask
-            edges = cv2.Canny((seg_mask * 255).astype(np.uint8), 50, 150)  # Canny edge detection
 
-            # Define a kernel for dilation (to make edges thicker)
-            kernel = np.ones((3, 3), np.uint8)
-            edges = cv2.dilate(edges, kernel, iterations=1)
+        if len(boxes) > 0:
+            # Calculate area of each bounding box (width * height)
+            areas = [(w * h, idx) for idx, (x, y, w, h) in enumerate(boxes)]
+            # Get the index of the bounding box with the largest area
+            _, max_area_idx = max(areas, key=lambda item: item[0])
 
-            # Draw the extracted edges in deep blue
-            frame_with_edges[edges != 0] = [139, 0, 0]  # Set edge pixels to deep blue
+            # Extract the largest bounding box
+            largest_box = boxes[max_area_idx]
 
-        # Check if any boxes (detections) are available before proceeding
-        if results[0].boxes is not None and results[0].boxes.id is not None:
-            # Get the boxes and track IDs from the detection
-            boxes = results[0].boxes.xywh.cpu()
-            track_ids = results[0].boxes.id.int().cpu().tolist()
+            # Check if track_ids is not empty and has sufficient length
+            if len(track_ids) > max_area_idx:
+                largest_track_id = track_ids[max_area_idx]
+            else:
+                # If track_ids is empty or shorter, set a default value (e.g., -1)
+                largest_track_id = -1
 
-            # Draw the tracking lines and arrows for each tracked object
-            for box, track_id in zip(boxes, track_ids):
+            # Visualize bounding boxes
+            for idx, (box, track_id) in enumerate(zip(boxes, track_ids)):
                 x, y, w, h = box
-                track = track_history[track_id]
-                current_point = (float(x), float(y))  # Current center point
-                track.append(current_point)
+                x1 = int(x - w / 2)
+                y1 = int(y - h / 2)
+                x2 = int(x + w / 2)
+                y2 = int(y + h / 2)
 
-                if len(track) > 20:  # If track has more than 20 points, retain last 20 and draw arrow
-                    track.pop(0)
+                # Check if the current box is the largest one
+                if idx == max_area_idx:
+                    # Draw the largest bounding box in red
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)  # Red color
+                else:
+                    # Draw other bounding boxes in blue
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue color
 
-                    # Draw the tracking lines
-                    points = np.array(track, dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(frame_with_edges, [points], isClosed=False, color=(230, 230, 230), thickness=2)
+            # Track and analyze the movement of the largest object
+            x, y, w, h = largest_box
+            track = track_history[largest_track_id]
+            current_point = (float(x), float(y))  # Current center point
+            track.append(current_point)
 
-                    # Draw an arrow based on the last frames
-                    start_point = track[-20]
-                    end_point = track[-1]
+            # Initialize a flag for danger detection
+            danger_flag = False
 
-                    start_point = tuple(map(int, start_point))
-                    end_point = tuple(map(int, end_point))
+            # If track has more than 5 points, retain the last 30 points and analyze direction
+            if len(track) > 6:
+                track.pop(0)
 
-                    # Draw the arrowed line indicating the movement direction
-                    cv2.arrowedLine(frame_with_edges, start_point, end_point, color=(0, 255, 0), thickness=3,
-                                    tipLength=0.3)
+                # Draw the tracking line
+                points = np.array(track, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(frame, [points], isClosed=False, color=(230, 230, 230), thickness=2)
 
-                    # Calculate direction and risk level
-                    direction = calculate_direction(start_point, end_point)
-                    risk_level = estimate_risk_level(direction)
+                # Draw an arrow based on the last 5 frames
+                start_point = tuple(map(int, track[-5]))
+                end_point = tuple(map(int, track[-1]))
 
-                    # Insert data into the database
-                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    cursor.execute("""
-                        INSERT INTO detections 
-                        (timestamp, object_type, x_coordinate, y_coordinate, direction, risk_level) 
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (current_time, 'person', x.item(), y.item(), direction, risk_level))
-                    conn.commit()
+                # Check if the movement direction is towards the left
+                if end_point[0] < start_point[0]:
+                    danger_flag = True
 
-        # Show the frame with the overlaid edges (if available) and tracking information
-        cv2.imshow("YOLOv8 Tracking with Edges Overlay (Webcam)", frame_with_edges)
+                # Draw the arrowed line indicating the movement direction
+                cv2.arrowedLine(frame, start_point, end_point, color=(0, 255, 0), thickness=3, tipLength=0.3)
+
+                # Calculate direction (left or right)
+                direction = calculate_direction(start_point, end_point)
+
+                # Insert data into the database (without risk_level)
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    """
+                    INSERT INTO detections 
+                    (timestamp, object_type, x_coordinate, y_coordinate, direction) 
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (current_time, 'person', x.item(), y.item(), direction)
+                )
+                conn.commit()
+
+            # Display "DANGER" if the largest object is moving to the left
+            if danger_flag:
+                cv2.putText(
+                    frame,
+                    "DANGER",
+                    (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.5,
+                    (0, 0, 255),  # Red color for danger
+                    3,
+                    cv2.LINE_AA,
+                )
+
+            # Display the frame with the bounding boxes and tracking information
+            cv2.imshow("YOLOv8 Tracking with Webcam Input", frame)
 
         # Break the loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord("q"):

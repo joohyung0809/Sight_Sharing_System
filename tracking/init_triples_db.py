@@ -12,8 +12,7 @@ CREATE TABLE IF NOT EXISTS detections (
     object_type VARCHAR(20) NOT NULL,
     x_coordinate FLOAT NOT NULL,
     y_coordinate FLOAT NOT NULL,
-    direction VARCHAR(20),
-    risk_level VARCHAR(10) NOT NULL
+    direction VARCHAR(20)
 );
 ''')
 
